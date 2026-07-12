@@ -1,0 +1,1 @@
+export default function SettingsPage() { return <main><section><p>Settings</p><h1>Workspace settings</h1><div className="grid"><article><b>Automation policy</b><small>Auto-approve low-risk proposals above 92% confidence.</small></article><article><b>Connected tools</b><small>Slack · GitHub · Jira</small></article></div></section></main>; }

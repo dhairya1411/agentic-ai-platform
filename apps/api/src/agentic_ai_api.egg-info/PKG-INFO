@@ -1,0 +1,26 @@
+Metadata-Version: 2.2
+Name: agentic-ai-api
+Version: 0.1.0
+Summary: API service for the AI Project Manager platform.
+Requires-Python: <3.13,>=3.12
+Description-Content-Type: text/markdown
+Requires-Dist: alembic<2.0.0,>=1.14.0
+Requires-Dist: asyncpg<0.31.0,>=0.30.0
+Requires-Dist: cryptography<45.0.0,>=44.0.0
+Requires-Dist: fastapi<0.116.0,>=0.115.6
+Requires-Dist: openai<3.0.0,>=1.66.0
+Requires-Dist: pydantic-settings<3.0.0,>=2.7.0
+Requires-Dist: PyJWT<3.0.0,>=2.10.0
+Requires-Dist: sqlalchemy<2.1.0,>=2.0.36
+Requires-Dist: uvicorn[standard]<0.35.0,>=0.34.0
+
+# API service
+
+Phase 3 establishes the FastAPI composition root and HTTP boundary. Run locally with:
+
+```powershell
+uv sync --all-groups
+uv run uvicorn agentic_ai_api.main:app --reload --host 0.0.0.0 --port 8000
+```
+
+The endpoints currently implemented are `GET /api/v1/health/live` and `GET /api/v1/health/ready`. Every successful request receives an `X-Request-ID` response header. Expected API errors use the documented `{ "error": { ... } }` envelope.

@@ -1,0 +1,12 @@
+{
+  "name": "agentic-ai-platform",
+  "version": "0.1.0",
+  "private": true,
+  "engines": { "node": ">=22.11.0 <23" },
+  "workspaces": ["apps/web"],
+  "scripts": {
+    "web:build": "npm --workspace @agentic-ai/web run build",
+    "web:lint": "npm --workspace @agentic-ai/web run lint",
+    "web:typecheck": "npm --workspace @agentic-ai/web run typecheck"
+  }
+}
