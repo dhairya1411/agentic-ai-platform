@@ -10,6 +10,7 @@ from langgraph.checkpoint.memory import InMemorySaver
 from agentic_ai_api.agents.contracts import ActionProposal, PlanOutput, SpecialistOutput
 from agentic_ai_api.agents.graph import AgentGraphFactory
 from agentic_ai_api.core.config import Settings
+from agentic_ai_api.llm.gateway import ModelGatewayError
 
 
 class FakeServices:
@@ -22,7 +23,9 @@ class FakeServices:
     async def plan(self, **_: object) -> PlanOutput:
         self.plan_calls += 1
         if self.fail_first_plan and self.plan_calls == 1:
-            raise RuntimeError("transient model failure")
+            # The real transient fault is ModelGatewayError, raised when every model
+            # attempt in the gateway fails. A bare RuntimeError would not be retried.
+            raise ModelGatewayError("transient model failure")
         return PlanOutput(
             objective="Triage a work update", specialists=["slack", "jira"], confidence=self.plan_confidence
         )

@@ -11,6 +11,19 @@ from langgraph.types import RetryPolicy
 from agentic_ai_api.agents.contracts import ActionProposal, ConfidenceDecision, PlanOutput, SpecialistName
 from agentic_ai_api.agents.services import AgentServices
 from agentic_ai_api.core.config import Settings
+from agentic_ai_api.llm.gateway import ModelGatewayError
+
+
+def is_transient_node_failure(exc: Exception) -> bool:
+    """Decide whether a failed node is worth another attempt.
+
+    LangGraph's default ``retry_on`` refuses to retry ``RuntimeError``, treating it as a
+    programming fault. ``ModelGatewayError`` subclasses ``RuntimeError``, so relying on that
+    default silently disables retries for the exact failure this policy exists to absorb.
+    Deterministic faults - bad schema, bad arguments, bad code - never improve on retry.
+    """
+    return isinstance(exc, ModelGatewayError | ConnectionError | TimeoutError)
+
 
 NodeName = Literal[
     "planner", "supervisor", "slack", "github", "jira", "meeting", "standup", "reporting",
@@ -42,7 +55,10 @@ class AgentGraphFactory:
     def compile(self, checkpointer: Any) -> Any:
         """Compile with an injected checkpointer so production owns persistence lifecycle."""
         graph = StateGraph(AgentState)
-        retry = RetryPolicy(max_attempts=self._settings.agent_node_retry_attempts)
+        retry = RetryPolicy(
+            max_attempts=self._settings.agent_node_retry_attempts,
+            retry_on=is_transient_node_failure,
+        )
         graph.add_node("planner", self._planner, retry_policy=retry)
         graph.add_node("supervisor", self._supervisor)
         for specialist in _SPECIALISTS:
@@ -127,7 +143,9 @@ class AgentGraphFactory:
             decisions.append(decision.model_dump(mode="json"))
         return {
             "decisions": decisions,
-            "status": "needs_review" if requires_review or any(d["approval_required"] for d in decisions) else "completed",
+            "status": "needs_review"
+            if requires_review or any(d["approval_required"] for d in decisions)
+            else "completed",
         }
 
 

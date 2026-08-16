@@ -25,7 +25,9 @@ class MemoryService:
 
     async def stage(self, organization_id: UUID, candidate: MemoryCandidate) -> Memory:
         """Persist a candidate for review; it is not searchable until approved."""
-        expires_at = candidate.expires_at or datetime.now(UTC) + timedelta(days=self._settings.memory_default_retention_days)
+        expires_at = candidate.expires_at or datetime.now(UTC) + timedelta(
+            days=self._settings.memory_default_retention_days
+        )
         memory = Memory(
             organization_id=organization_id, project_id=candidate.project_id, source_type=candidate.source_type,
             source_ref=candidate.source_ref, content=candidate.content, importance=candidate.importance,
@@ -43,7 +45,8 @@ class MemoryService:
         vector = await self._embeddings.embed(memory.content)
         await self._index.upsert(
             memory.id, vector,
-            {"organization_id": str(memory.organization_id), "project_id": str(memory.project_id) if memory.project_id else None,
+            {"organization_id": str(memory.organization_id),
+             "project_id": str(memory.project_id) if memory.project_id else None,
              "source_type": memory.source_type},
         )
         memory.qdrant_point_id, memory.status = memory.id, "active"
@@ -78,7 +81,9 @@ class MemoryService:
     async def expire_due(self, organization_id: UUID) -> int:
         """Remove expired points and mark records before they can be retrieved again."""
         rows = list(await self._session.scalars(select(Memory).where(
-            Memory.organization_id == organization_id, Memory.status == "active", Memory.expires_at <= datetime.now(UTC),
+            Memory.organization_id == organization_id,
+            Memory.status == "active",
+            Memory.expires_at <= datetime.now(UTC),
         )))
         await self._index.delete([row.id for row in rows])
         for row in rows:

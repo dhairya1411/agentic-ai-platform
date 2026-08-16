@@ -74,4 +74,8 @@ class GoogleOAuthClient:
         if not isinstance(subject, str) or not isinstance(email, str):
             raise ValueError("Google user profile is missing required claims")
         name = profile.get("name")
-        return GoogleProfile(subject=subject, email=email.lower(), display_name=name if isinstance(name, str) else email)
+        return GoogleProfile(
+            subject=subject,
+            email=email.lower(),
+            display_name=name if isinstance(name, str) else email,
+        )

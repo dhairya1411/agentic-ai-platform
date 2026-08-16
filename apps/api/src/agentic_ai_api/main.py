@@ -13,10 +13,10 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response
 from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoint
 
-from agentic_ai_api.api.routers.health import router as health_router
-from agentic_ai_api.api.routers.dashboard import router as dashboard_router
-from agentic_ai_api.api.routers.workspace import router as workspace_router
 from agentic_ai_api.api.routers.auth import router as auth_router
+from agentic_ai_api.api.routers.dashboard import router as dashboard_router
+from agentic_ai_api.api.routers.health import router as health_router
+from agentic_ai_api.api.routers.workspace import router as workspace_router
 from agentic_ai_api.core.config import Settings, get_settings
 from agentic_ai_api.core.errors import (
     APIError,

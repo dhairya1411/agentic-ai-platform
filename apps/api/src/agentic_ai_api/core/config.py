@@ -3,16 +3,26 @@
 from __future__ import annotations
 
 from functools import lru_cache
+from pathlib import Path
 from typing import Literal
 
 from pydantic import Field, SecretStr, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+# Load .env from both the repo root and this service folder, regardless of the
+# current working directory. Later entries win, so a service-local apps/api/.env
+# overrides the repo root if both are present.
+_SERVICE_ROOT = Path(__file__).resolve().parents[3]  # apps/api
+_REPO_ROOT = Path(__file__).resolve().parents[5]  # repository root
+_ENV_FILES = (_REPO_ROOT / ".env", _SERVICE_ROOT / ".env")
+
 
 class Settings(BaseSettings):
     """Runtime settings with production-only secret safeguards."""
 
-    model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
+    model_config = SettingsConfigDict(
+        env_file=_ENV_FILES, env_file_encoding="utf-8", extra="ignore"
+    )
 
     app_env: Literal["development", "test", "staging", "production"] = "development"
     app_name: str = "Agentic AI Platform"
@@ -33,8 +43,16 @@ class Settings(BaseSettings):
     google_redirect_uri: str = "http://localhost:8000/api/v1/auth/google/callback"
     auth_cookie_secure: bool = False
     openai_api_key: SecretStr = SecretStr("")
-    llm_primary_model: str = "gpt-5-mini"
-    llm_fallback_model: str = "gpt-4o-mini"
+    # Any OpenAI-compatible endpoint. Groq serves the Responses API at
+    # https://api.groq.com/openai/v1 and is free at the tier this project targets.
+    llm_base_url: str = ""
+    llm_primary_model: str = "openai/gpt-oss-120b"
+    llm_fallback_model: str = "openai/gpt-oss-20b"
+    # Strict json_schema requires every object to set additionalProperties:false and list
+    # every property as required. ActionProposal.arguments is an open dict by design - action
+    # arguments vary per action_type - so it cannot satisfy that. Schema conformance is
+    # enforced by Pydantic validation of the response instead, which fails closed.
+    llm_strict_schema: bool = False
     llm_max_output_tokens: int = Field(default=1_500, ge=64, le=16_000)
     llm_retry_attempts: int = Field(default=2, ge=1, le=4)
     llm_request_timeout_seconds: float = Field(default=30.0, ge=1.0, le=120.0)
@@ -57,7 +75,11 @@ class Settings(BaseSettings):
             encryption_key = self.encryption_key.get_secret_value()
             if len(jwt_secret) < 32 or jwt_secret.startswith("replace-with") or jwt_secret.startswith("local-"):
                 raise ValueError("JWT_SECRET_KEY must be a unique 32+ character deployment secret")
-            if len(encryption_key) < 32 or encryption_key.startswith("replace-with") or encryption_key.startswith("local-"):
+            if (
+                len(encryption_key) < 32
+                or encryption_key.startswith("replace-with")
+                or encryption_key.startswith("local-")
+            ):
                 raise ValueError("ENCRYPTION_KEY must be supplied by the deployment secret manager")
             if not self.google_client_id or not self.google_client_secret.get_secret_value():
                 raise ValueError("Google OAuth credentials are required outside development")

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping, Sequence
 from typing import Any
 
 from pydantic import BaseModel, Field
@@ -49,8 +50,12 @@ class APIError(Exception):
         self.headers = headers or {}
 
 
-def validation_details(errors: list[dict[str, Any]]) -> list[ErrorDetail]:
-    """Translate FastAPI validation diagnostics into the stable public contract."""
+def validation_details(errors: Sequence[Mapping[str, Any]]) -> list[ErrorDetail]:
+    """Translate FastAPI validation diagnostics into the stable public contract.
+
+    Accepts a read-only sequence because ``RequestValidationError.errors()`` returns a
+    ``Sequence``, not a ``list``.
+    """
     return [
         ErrorDetail(field=".".join(str(part) for part in error["loc"]), message=error["msg"])
         for error in errors

@@ -7,8 +7,8 @@ Create Date: 2026-07-12
 
 from collections.abc import Sequence
 
-from alembic import op
 import sqlalchemy as sa
+from alembic import op
 from sqlalchemy.dialects import postgresql
 
 revision: str = "20260712_0005"
@@ -45,7 +45,10 @@ def upgrade() -> None:
     expression = "organization_id = NULLIF(current_setting('app.current_organization_id', true), '')::uuid"
     op.execute("ALTER TABLE memory_retrieval_logs ENABLE ROW LEVEL SECURITY")
     op.execute("ALTER TABLE memory_retrieval_logs FORCE ROW LEVEL SECURITY")
-    op.execute(f"CREATE POLICY tenant_isolation ON memory_retrieval_logs USING ({expression}) WITH CHECK ({expression})")
+    op.execute(
+        f"CREATE POLICY tenant_isolation ON memory_retrieval_logs "
+        f"USING ({expression}) WITH CHECK ({expression})"
+    )
     op.create_index("ix_memory_retrieval_logs_run", "memory_retrieval_logs", ["workflow_run_id", "rank"])
 
 
