@@ -43,8 +43,16 @@ class Settings(BaseSettings):
     google_redirect_uri: str = "http://localhost:8000/api/v1/auth/google/callback"
     auth_cookie_secure: bool = False
     openai_api_key: SecretStr = SecretStr("")
-    llm_primary_model: str = "gpt-5-mini"
-    llm_fallback_model: str = "gpt-4o-mini"
+    # Any OpenAI-compatible endpoint. Groq serves the Responses API at
+    # https://api.groq.com/openai/v1 and is free at the tier this project targets.
+    llm_base_url: str = ""
+    llm_primary_model: str = "openai/gpt-oss-120b"
+    llm_fallback_model: str = "openai/gpt-oss-20b"
+    # Strict json_schema requires every object to set additionalProperties:false and list
+    # every property as required. ActionProposal.arguments is an open dict by design - action
+    # arguments vary per action_type - so it cannot satisfy that. Schema conformance is
+    # enforced by Pydantic validation of the response instead, which fails closed.
+    llm_strict_schema: bool = False
     llm_max_output_tokens: int = Field(default=1_500, ge=64, le=16_000)
     llm_retry_attempts: int = Field(default=2, ge=1, le=4)
     llm_request_timeout_seconds: float = Field(default=30.0, ge=1.0, le=120.0)
@@ -67,7 +75,11 @@ class Settings(BaseSettings):
             encryption_key = self.encryption_key.get_secret_value()
             if len(jwt_secret) < 32 or jwt_secret.startswith("replace-with") or jwt_secret.startswith("local-"):
                 raise ValueError("JWT_SECRET_KEY must be a unique 32+ character deployment secret")
-            if len(encryption_key) < 32 or encryption_key.startswith("replace-with") or encryption_key.startswith("local-"):
+            if (
+                len(encryption_key) < 32
+                or encryption_key.startswith("replace-with")
+                or encryption_key.startswith("local-")
+            ):
                 raise ValueError("ENCRYPTION_KEY must be supplied by the deployment secret manager")
             if not self.google_client_id or not self.google_client_secret.get_secret_value():
                 raise ValueError("Google OAuth credentials are required outside development")

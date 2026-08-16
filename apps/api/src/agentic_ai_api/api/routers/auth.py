@@ -4,8 +4,8 @@ from __future__ import annotations
 
 from datetime import timedelta
 
-import jwt
 import httpx
+import jwt
 from fastapi import APIRouter, Cookie, Depends, Response, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel
@@ -118,7 +118,11 @@ async def complete_google_login(
     try:
         profile = await GoogleOAuthClient(settings).profile_from_code(code)
     except (httpx.HTTPError, ValueError) as exc:
-        raise APIError(status_code=401, code="oauth_exchange_failed", message="Google login could not be verified.") from exc
+        raise APIError(
+            status_code=401,
+            code="oauth_exchange_failed",
+            message="Google login could not be verified.",
+        ) from exc
 
     identity = await session.scalar(
         select(ExternalIdentity).where(
@@ -166,7 +170,9 @@ async def refresh_access_token(
         raise APIError(status_code=401, code="unauthenticated", message="Refresh session is required.")
     token_service = TokenService(settings)
     auth_session = await session.scalar(
-        select(AuthSession).where(AuthSession.refresh_token_hash == token_service.token_hash(refresh_token)).with_for_update()
+        select(AuthSession)
+        .where(AuthSession.refresh_token_hash == token_service.token_hash(refresh_token))
+        .with_for_update()
     )
     if auth_session is None or auth_session.revoked_at is not None or auth_session.expires_at <= utc_now():
         raise APIError(status_code=401, code="unauthenticated", message="Refresh session is invalid or expired.")

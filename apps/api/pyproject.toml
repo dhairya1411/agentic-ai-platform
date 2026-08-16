@@ -29,10 +29,14 @@ where = ["src"]
 dev = ["httpx>=0.28.1,<0.29.0", "mypy>=1.14.0,<2.0.0", "pytest>=8.3.4,<9.0.0", "pytest-asyncio>=0.25.0,<0.26.0", "ruff>=0.8.4,<0.9.0"]
 
 [tool.ruff]
-line-length = 100
+line-length = 120
 target-version = "py312"
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "SIM"]
+[tool.ruff.lint.flake8-bugbear]
+# FastAPI's dependency-injection markers are evaluated once at import time by design;
+# B008 would otherwise flag every route signature in the codebase.
+extend-immutable-calls = ["fastapi.Depends", "fastapi.Query", "fastapi.Path", "fastapi.Header", "fastapi.Cookie", "fastapi.Body", "fastapi.Form", "fastapi.File"]
 [tool.mypy]
 python_version = "3.12"
 strict = true

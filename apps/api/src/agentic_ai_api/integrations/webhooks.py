@@ -18,7 +18,9 @@ def verify_hmac(secret: str, signed: bytes, signature: str, prefix: str = "") ->
     return hmac.compare_digest(expected, signature)
 
 
-def verify_slack_signature(secret: str, timestamp: str, body: bytes, signature: str, now: datetime | None = None) -> bool:
+def verify_slack_signature(
+    secret: str, timestamp: str, body: bytes, signature: str, now: datetime | None = None
+) -> bool:
     """Verify Slack v0 signature and reject replayable timestamps older than five minutes."""
     try:
         sent_at = int(timestamp)

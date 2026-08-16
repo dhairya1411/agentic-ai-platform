@@ -7,8 +7,8 @@ Create Date: 2026-07-12
 
 from collections.abc import Sequence
 
-from alembic import op
 import sqlalchemy as sa
+from alembic import op
 from sqlalchemy.dialects import postgresql
 
 revision: str = "20260712_0002"
@@ -67,14 +67,20 @@ def upgrade() -> None:
         sa.Column("title", sa.Text(), nullable=False),
         sa.Column("status", sa.String(64), nullable=False),
         sa.Column("assignee_membership_id", uuid, sa.ForeignKey("organization_memberships.id")),
-        constraints=(sa.UniqueConstraint("organization_id", "provider", "external_ref", name="uq_work_item_provider_ref"),),
+        constraints=(
+            sa.UniqueConstraint("organization_id", "provider", "external_ref", name="uq_work_item_provider_ref"),
+        ),
     )
     _tenant_table(
         "conversations",
         sa.Column("provider", sa.String(32), nullable=False),
         sa.Column("external_ref", sa.String(255), nullable=False),
         sa.Column("project_id", uuid, sa.ForeignKey("projects.id")),
-        constraints=(sa.UniqueConstraint("organization_id", "provider", "external_ref", name="uq_conversation_provider_ref"),),
+        constraints=(
+            sa.UniqueConstraint(
+                "organization_id", "provider", "external_ref", name="uq_conversation_provider_ref"
+            ),
+        ),
     )
     _tenant_table(
         "messages",
@@ -164,7 +170,9 @@ def upgrade() -> None:
         sa.Column("external_ref", sa.String(255), nullable=False),
         sa.Column("title", sa.String(500), nullable=False),
         sa.Column("access_policy_json", json, nullable=False),
-        constraints=(sa.UniqueConstraint("organization_id", "provider", "external_ref", name="uq_knowledge_provider_ref"),),
+        constraints=(
+            sa.UniqueConstraint("organization_id", "provider", "external_ref", name="uq_knowledge_provider_ref"),
+        ),
     )
     _tenant_table(
         "memories",

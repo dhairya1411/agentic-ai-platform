@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import time
-from typing import Any, Protocol
+from typing import Any, Protocol, cast
 from uuid import UUID
 
 from openai import AsyncOpenAI
@@ -52,8 +52,14 @@ class OpenAIModelGateway:
     ) -> None:
         self._settings = settings
         api_key = settings.openai_api_key.get_secret_value()
-        self._client: ResponsesClient = client or AsyncOpenAI(
-            api_key=api_key or None, timeout=settings.llm_request_timeout_seconds
+        self._client: ResponsesClient = client or cast(
+            ResponsesClient,
+            AsyncOpenAI(
+                api_key=api_key or None,
+                # Any OpenAI-compatible endpoint; empty string means the default OpenAI host.
+                base_url=settings.llm_base_url or None,
+                timeout=settings.llm_request_timeout_seconds,
+            ),
         )
         self._redactor = Redactor()
         self._recorder = recorder
@@ -85,7 +91,7 @@ class OpenAIModelGateway:
                                 "type": "json_schema",
                                 "name": request.output_model.__name__.lower(),
                                 "schema": request.output_model.model_json_schema(),
-                                "strict": True,
+                                "strict": self._settings.llm_strict_schema,
                             }
                         },
                         tools=[tool.as_openai_tool() for tool in request.tools],
