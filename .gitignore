@@ -32,3 +32,6 @@ Thumbs.db
 data/
 prometheus-data/
 grafana-data/
+
+# Patch files exchanged during development
+*.patch
