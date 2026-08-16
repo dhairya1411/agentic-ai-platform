@@ -8,7 +8,9 @@ from uuid import UUID
 from langgraph.graph import END, START, StateGraph
 from langgraph.types import RetryPolicy
 
+from agentic_ai_api.agents.actions import partition_proposals
 from agentic_ai_api.agents.contracts import ActionProposal, ConfidenceDecision, PlanOutput, SpecialistName
+from agentic_ai_api.agents.reconciliation import reconcile
 from agentic_ai_api.agents.services import AgentServices
 from agentic_ai_api.core.config import Settings
 from agentic_ai_api.llm.gateway import ModelGatewayError
@@ -41,6 +43,8 @@ class AgentState(TypedDict, total=False):
     pending_specialists: list[SpecialistName]
     completed_specialists: list[SpecialistName]
     proposals: list[dict[str, object]]
+    # Proposals dropped before policy because they could not be executed as written.
+    rejected_proposals: list[dict[str, str]]
     decisions: list[dict[str, object]]
     status: Literal["running", "completed", "needs_review", "rejected"]
 
@@ -104,14 +108,24 @@ class AgentGraphFactory:
             )
             pending = [item for item in state.get("pending_specialists", []) if item != specialist]
             completed = [*state.get("completed_specialists", []), specialist]
+            # Drop proposals that cannot be executed before they reach the policy. The policy
+            # weighs confidence and risk; it has no view on whether the arguments are usable.
+            accepted, rejected = partition_proposals(list(result.proposals))
             proposals = [
                 *state.get("proposals", []),
-                *(item.model_dump(mode="json") for item in result.proposals),
+                # Attribution travels with the proposal so reconciliation and the audit log
+                # can both answer "which specialist wanted this?".
+                *({**item.model_dump(mode="json"), "specialist": specialist} for item in accepted),
+            ]
+            rejections = [
+                *state.get("rejected_proposals", []),
+                *({**item, "specialist": specialist} for item in rejected),
             ]
             return {
                 "pending_specialists": pending,
                 "completed_specialists": completed,
                 "proposals": proposals,
+                "rejected_proposals": rejections,
             }
 
         return run
@@ -125,20 +139,38 @@ class AgentGraphFactory:
     def _confidence_policy(self, state: AgentState) -> AgentState:
         decisions: list[dict[str, object]] = []
         requires_review = state.get("status") == "needs_review"
-        for proposal_json in state.get("proposals", []):
-            proposal = ActionProposal.model_validate(proposal_json)
-            approval_required = (
-                requires_review
-                or proposal.risk_level != "low"
-                or proposal.confidence < self._settings.agent_auto_approval_confidence
+        # Fan-in: specialists worked independently, so the same action can arrive several
+        # times, and two specialists can target one resource with different payloads.
+        reconciled = reconcile(list(state.get("proposals", [])))
+        for item in reconciled:
+            proposal = ActionProposal.model_validate(item)
+            contested = bool(item["contested"])
+            proposed_by = [str(name) for name in item["proposed_by"]]
+            reasons: list[str] = []
+            if requires_review:
+                reasons.append("the plan itself was routed for review")
+            if contested:
+                reasons.append("another proposal targets the same resource with different arguments")
+            if proposal.risk_level != "low":
+                reasons.append(f"risk level is {proposal.risk_level}")
+            if proposal.confidence < self._settings.agent_auto_approval_confidence:
+                reasons.append(
+                    f"confidence {proposal.confidence:.2f} is below the "
+                    f"{self._settings.agent_auto_approval_confidence:.2f} auto-approval threshold"
+                )
+
+            approval_required = bool(reasons)
+            reason = (
+                f"Requires human approval: {'; '.join(reasons)}."
+                if approval_required
+                else "Eligible for later policy evaluation."
             )
-            reason = "Eligible for later policy evaluation."
-            if approval_required:
-                reason = "Requires human approval due to confidence or risk policy."
             decision = ConfidenceDecision(
                 action_type=proposal.action_type,
                 approval_required=approval_required,
                 reason=reason,
+                proposed_by=proposed_by,
+                contested=contested,
             )
             decisions.append(decision.model_dump(mode="json"))
         return {
