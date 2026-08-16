@@ -39,7 +39,9 @@ class FakeServices:
             proposals=[
                 ActionProposal(
                     action_type="jira.transition",
-                    arguments={"issue_key": "ABC-1"},
+                    # Must be a fully executable proposal: the graph now drops proposals
+                    # whose arguments could not actually be carried out.
+                    arguments={"issue_key": "ABC-1", "status": "Done"},
                     confidence=0.95,
                     risk_level="low",
                     rationale="The source event identifies a completed backend change.",
@@ -88,3 +90,98 @@ async def test_retry_policy_retries_transient_planner_failure() -> None:
     )
 
     assert services.plan_calls == 2
+
+
+class PlaceholderServices(FakeServices):
+    """Reproduces the first live Groq run: a confident proposal nobody could execute."""
+
+    async def analyze(self, **kwargs: object) -> SpecialistOutput:
+        self.specialists.append(str(kwargs["specialist"]))
+        return SpecialistOutput(
+            summary="Analysis complete",
+            confidence=0.97,
+            proposals=[
+                ActionProposal(
+                    action_type="github.comment",
+                    arguments={"owner": "<owner>", "repo": "<repo>", "number": 482, "body": "Rolled back."},
+                    confidence=0.96,
+                    risk_level="low",
+                    rationale="The event names PR 482 as the likely cause of the incident.",
+                )
+            ],
+        )
+
+
+@pytest.mark.asyncio
+async def test_unexecutable_proposals_never_reach_the_policy() -> None:
+    services = PlaceholderServices()
+    graph = AgentGraphFactory(Settings(), services).compile(InMemorySaver())
+
+    result = await graph.ainvoke(
+        {"organization_id": str(uuid4()), "trace_id": "trace-4", "event": {"body": "500s after deploy"}},
+        {"configurable": {"thread_id": "workflow-4"}},
+    )
+
+    assert result["proposals"] == []
+    assert result["decisions"] == []
+    rejected = result["rejected_proposals"]
+    assert len(rejected) == 2  # one per specialist the planner routed to
+    assert all(item["action_type"] == "github.comment" for item in rejected)
+    assert all("placeholder" in item["reason"] for item in rejected)
+
+
+class DisagreeingServices(FakeServices):
+    """Two specialists reply to the same Slack channel with different text."""
+
+    async def analyze(self, **kwargs: object) -> SpecialistOutput:
+        specialist = str(kwargs["specialist"])
+        self.specialists.append(specialist)
+        return SpecialistOutput(
+            summary="Analysis complete",
+            confidence=0.97,
+            proposals=[
+                ActionProposal(
+                    action_type="slack.reply",
+                    arguments={"channel": "#eng-backend", "text": f"Reply written by {specialist}."},
+                    confidence=0.95,
+                    risk_level="low",
+                    rationale="The event arrived in this channel and warrants acknowledgement.",
+                )
+            ],
+        )
+
+
+@pytest.mark.asyncio
+async def test_duplicate_proposals_collapse_into_one_decision() -> None:
+    services = FakeServices()
+    graph = AgentGraphFactory(Settings(), services).compile(InMemorySaver())
+
+    result = await graph.ainvoke(
+        {"organization_id": str(uuid4()), "trace_id": "trace-5", "event": {"body": "done"}},
+        {"configurable": {"thread_id": "workflow-5"}},
+    )
+
+    # Both specialists proposed the identical transition; one action, both credited.
+    assert len(result["proposals"]) == 2
+    assert len(result["decisions"]) == 1
+    assert result["decisions"][0]["proposed_by"] == ["jira", "slack"]
+    assert result["decisions"][0]["contested"] is False
+
+
+@pytest.mark.asyncio
+async def test_contested_proposals_cannot_auto_approve() -> None:
+    services = DisagreeingServices()
+    graph = AgentGraphFactory(Settings(), services).compile(InMemorySaver())
+
+    result = await graph.ainvoke(
+        {"organization_id": str(uuid4()), "trace_id": "trace-6", "event": {"body": "500s"}},
+        {"configurable": {"thread_id": "workflow-6"}},
+    )
+
+    decisions = result["decisions"]
+    assert len(decisions) == 2
+    # Low risk and 0.95 confidence would otherwise clear the 0.92 threshold.
+    assert all(decision["approval_required"] for decision in decisions)
+    assert all(decision["contested"] for decision in decisions)
+    assert all("same resource" in decision["reason"] for decision in decisions)
+    assert result["status"] == "needs_review"

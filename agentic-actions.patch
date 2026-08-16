@@ -1,0 +1,801 @@
+diff --git a/apps/api/scripts/run_agent_once.py b/apps/api/scripts/run_agent_once.py
+index 710e46d..399e252 100644
+--- a/apps/api/scripts/run_agent_once.py
++++ b/apps/api/scripts/run_agent_once.py
+@@ -21,6 +21,7 @@ from uuid import UUID, uuid4
+ 
+ from langgraph.checkpoint.memory import InMemorySaver
+ 
++from agentic_ai_api.agents.actions import ACTION_CATALOGUE
+ from agentic_ai_api.agents.graph import AgentGraphFactory
+ from agentic_ai_api.agents.services import GatewayAgentServices
+ from agentic_ai_api.core.config import get_settings
+@@ -54,8 +55,15 @@ SPECIALIST_TEMPLATE = """You are the {specialist} specialist in a governed agent
+ You analyse the event and propose actions. You never execute anything - every proposal is
+ reviewed by a confidence and risk policy before a human sees it.
+ 
+-For each proposal:
+-- action_type is lowercase dotted, e.g. jira.transition, slack.reply, github.comment
++You may only propose these declared actions, with exactly these arguments:
++
++{catalogue}
++
++Rules:
++- Every argument must come from the event. If the event does not supply a required value -
++  a repository name, an issue key - do NOT propose that action. Never invent a value and
++  never emit a placeholder like <owner> or {{{{repo}}}}. Proposals with unusable arguments
++  are rejected before a human ever sees them.
+ - risk_level is low, medium or high. Anything that writes to a system another human relies
+   on, or that is hard to reverse, is not low.
+ - confidence is your certainty this action is correct, from 0 to 1.
+@@ -66,6 +74,15 @@ is a valid, often correct answer.
+ 
+ Respond only with the required JSON object."""
+ 
++
++def _catalogue_text() -> str:
++    """Render the declared actions so specialists cannot invent action types or arguments."""
++    lines = []
++    for action_type, definition in sorted(ACTION_CATALOGUE.items()):
++        required = ", ".join(definition.parameters["required"])
++        lines.append(f"  {action_type}({required}) - {definition.description}")
++    return "\n".join(lines)
++
+ DEFAULT_EVENT = {
+     "source": "slack",
+     "channel": "#eng-backend",
+@@ -102,7 +119,10 @@ async def main() -> int:
+         gateway=gateway,
+         planner_prompt=_prompt("planner", PLANNER_TEMPLATE),
+         specialist_prompts={
+-            name: _prompt(f"specialist.{name}", SPECIALIST_TEMPLATE.format(specialist=name))
++            name: _prompt(
++                f"specialist.{name}",
++                SPECIALIST_TEMPLATE.format(specialist=name, catalogue=_catalogue_text()),
++            )
+             for name in (
+                 "slack", "github", "jira", "meeting",
+                 "standup", "reporting", "notification", "knowledge",
+@@ -138,10 +158,19 @@ async def main() -> int:
+         print(f"      args   : {json.dumps(proposal.get('arguments', {}))}")
+         print(f"      because: {proposal['rationale'][:140]}")
+ 
+-    print(f"\nDECISIONS ({len(result.get('decisions', []))})")
+-    for decision in result.get("decisions", []):
++    rejected = result.get("rejected_proposals", [])
++    if rejected:
++        print(f"\nREJECTED BEFORE POLICY ({len(rejected)}) - not executable as written")
++        for item in rejected:
++            print(f"  {item['action_type']:<24} [{item.get('specialist', '?')}]  {item['reason']}")
++
++    decisions = result.get("decisions", [])
++    print(f"\nDECISIONS ({len(decisions)} after fan-in, from {len(result.get('proposals', []))} proposals)")
++    for decision in decisions:
+         gate = "NEEDS APPROVAL" if decision["approval_required"] else "auto-approvable"
+-        print(f"  {decision['action_type']:<24} {gate}")
++        flag = "  [CONTESTED]" if decision.get("contested") else ""
++        print(f"  {decision['action_type']:<24} {gate}{flag}")
++        print(f"      proposed by: {', '.join(decision.get('proposed_by') or ['?'])}")
+         print(f"      {decision['reason']}")
+ 
+     print(f"\nfinal status: {result.get('status')}")
+diff --git a/apps/api/src/agentic_ai_api/agents/actions.py b/apps/api/src/agentic_ai_api/agents/actions.py
+new file mode 100644
+index 0000000..57b0fbe
+--- /dev/null
++++ b/apps/api/src/agentic_ai_api/agents/actions.py
+@@ -0,0 +1,182 @@
++"""Declared action catalogue and executability checks for specialist proposals.
++
++A proposal is only useful if it can actually be carried out. The confidence policy answers
++"should a human approve this?" - it never asks "could this even run?". A live run surfaced
++the gap: the GitHub specialist proposed a comment on `{"owner": "<owner>", "repo": "<repo>"}`
++because the source event never named a repository. The policy passed it through, because a
++placeholder is a perfectly confident, perfectly low-risk string.
++
++Two layers close it:
++
++1. **Declared actions only.** An action_type outside this catalogue is rejected. The platform
++   is built on the premise that an agent cannot take an action nobody declared.
++2. **Argument checks.** Shape, type, pattern - and a placeholder guard, because a schema
++   cannot tell `<owner>` from a real account name, and free-text fields have no pattern
++   to fail against.
++"""
++
++from __future__ import annotations
++
++import re
++from typing import Any
++
++from agentic_ai_api.agents.contracts import ActionProposal
++from agentic_ai_api.llm.contracts import ToolDefinition
++
++# Values a model emits when it knows a field is required but the event never supplied it.
++_PLACEHOLDER_PATTERNS = (
++    re.compile(r"<[^>]{1,64}>"),  # <owner>, <repo>, <issue key>
++    re.compile(r"\{\{[^}]{1,64}\}\}"),  # {{repo}}
++    re.compile(r"^(tbd|todo|unknown|n/?a|none|null|xxx+|\.\.\.)$", re.IGNORECASE),
++)
++
++_SLACK_CHANNEL = r"^[#@]?[a-z0-9][a-z0-9._-]{0,79}$"
++_JIRA_KEY = r"^[A-Z][A-Z0-9]{1,9}-[1-9][0-9]{0,6}$"
++_GH_OWNER = r"^[A-Za-z0-9](?:[A-Za-z0-9]|-(?=[A-Za-z0-9])){0,38}$"
++_GH_REPO = r"^[A-Za-z0-9._-]{1,100}$"
++
++
++def _tool(name: str, description: str, properties: dict[str, Any], required: list[str]) -> ToolDefinition:
++    return ToolDefinition(
++        name=name.replace(".", "_"),
++        description=description,
++        parameters={
++            "type": "object",
++            "properties": properties,
++            "required": required,
++            "additionalProperties": False,
++        },
++    )
++
++
++ACTION_CATALOGUE: dict[str, ToolDefinition] = {
++    "slack.reply": _tool(
++        "slack.reply",
++        "Post a reply in the Slack channel the event came from.",
++        {
++            "channel": {"type": "string", "pattern": _SLACK_CHANNEL},
++            "text": {"type": "string", "minLength": 1, "maxLength": 4000},
++        },
++        ["channel", "text"],
++    ),
++    "jira.transition": _tool(
++        "jira.transition",
++        "Move a Jira issue to a different workflow status.",
++        {
++            "issue_key": {"type": "string", "pattern": _JIRA_KEY},
++            "status": {"type": "string", "minLength": 1, "maxLength": 100},
++        },
++        ["issue_key", "status"],
++    ),
++    "jira.comment": _tool(
++        "jira.comment",
++        "Add a comment to a Jira issue.",
++        {
++            "issue_key": {"type": "string", "pattern": _JIRA_KEY},
++            "comment": {"type": "string", "minLength": 1, "maxLength": 8000},
++        },
++        ["issue_key", "comment"],
++    ),
++    "github.comment": _tool(
++        "github.comment",
++        "Comment on a GitHub pull request or issue.",
++        {
++            "owner": {"type": "string", "pattern": _GH_OWNER},
++            "repo": {"type": "string", "pattern": _GH_REPO},
++            "number": {"type": "integer", "minimum": 1},
++            "body": {"type": "string", "minLength": 1, "maxLength": 8000},
++        },
++        ["owner", "repo", "number", "body"],
++    ),
++    "notification.send": _tool(
++        "notification.send",
++        "Notify a person or group outside the originating channel.",
++        {
++            "recipient": {"type": "string", "minLength": 1, "maxLength": 200},
++            "message": {"type": "string", "minLength": 1, "maxLength": 2000},
++        },
++        ["recipient", "message"],
++    ),
++    "knowledge.store": _tool(
++        "knowledge.store",
++        "Persist a durable fact about the project to long-term memory.",
++        {
++            "title": {"type": "string", "minLength": 1, "maxLength": 200},
++            "body": {"type": "string", "minLength": 1, "maxLength": 8000},
++        },
++        ["title", "body"],
++    ),
++}
++
++DECLARED_ACTIONS: tuple[str, ...] = tuple(sorted(ACTION_CATALOGUE))
++
++
++def _looks_like_placeholder(value: str) -> bool:
++    return any(pattern.search(value.strip()) for pattern in _PLACEHOLDER_PATTERNS)
++
++
++def _check_value(name: str, value: Any, schema: dict[str, Any]) -> str | None:
++    """Validate one argument against its declared schema. Returns a reason, or None."""
++    expected = schema.get("type")
++    if expected == "integer":
++        # bool is a subclass of int; a boolean where an id belongs is a mistake, not a value.
++        if isinstance(value, bool) or not isinstance(value, int):
++            return f"'{name}' must be an integer"
++        minimum = schema.get("minimum")
++        if isinstance(minimum, int) and value < minimum:
++            return f"'{name}' must be at least {minimum}"
++        return None
++
++    if expected == "string":
++        if not isinstance(value, str):
++            return f"'{name}' must be a string"
++        if _looks_like_placeholder(value):
++            return f"'{name}' is an unresolved placeholder ({value.strip()[:40]!r})"
++        minimum_length = schema.get("minLength")
++        if isinstance(minimum_length, int) and len(value) < minimum_length:
++            return f"'{name}' is shorter than {minimum_length} characters"
++        maximum_length = schema.get("maxLength")
++        if isinstance(maximum_length, int) and len(value) > maximum_length:
++            return f"'{name}' exceeds {maximum_length} characters"
++        pattern = schema.get("pattern")
++        if isinstance(pattern, str) and not re.match(pattern, value):
++            return f"'{name}' does not match the expected format for this field"
++    return None
++
++
++def rejection_reason(proposal: ActionProposal) -> str | None:
++    """Return why a proposal cannot be executed, or None when it is well formed.
++
++    Deliberately independent of confidence and risk. A proposal can be high-confidence,
++    low-risk and still impossible to carry out.
++    """
++    definition = ACTION_CATALOGUE.get(proposal.action_type)
++    if definition is None:
++        return f"'{proposal.action_type}' is not a declared action"
++
++    try:
++        arguments = definition.validate_arguments(proposal.arguments)
++    except ValueError as exc:
++        return str(exc)
++
++    properties: dict[str, Any] = definition.parameters["properties"]
++    for name, value in arguments.items():
++        reason = _check_value(name, value, properties[name])
++        if reason is not None:
++            return reason
++    return None
++
++
++def partition_proposals(
++    proposals: list[ActionProposal],
++) -> tuple[list[ActionProposal], list[dict[str, str]]]:
++    """Split proposals into executable ones and rejections carrying their reason."""
++    accepted: list[ActionProposal] = []
++    rejected: list[dict[str, str]] = []
++    for proposal in proposals:
++        reason = rejection_reason(proposal)
++        if reason is None:
++            accepted.append(proposal)
++        else:
++            rejected.append({"action_type": proposal.action_type, "reason": reason})
++    return accepted, rejected
+diff --git a/apps/api/src/agentic_ai_api/agents/contracts.py b/apps/api/src/agentic_ai_api/agents/contracts.py
+index c096ff5..9f993e6 100644
+--- a/apps/api/src/agentic_ai_api/agents/contracts.py
++++ b/apps/api/src/agentic_ai_api/agents/contracts.py
+@@ -48,3 +48,8 @@ class ConfidenceDecision(BaseModel):
+     action_type: str
+     approval_required: bool
+     reason: str
++    # Which specialists proposed this action. More than one is corroboration, and the
++    # audit log should be able to answer "who wanted this?" as well as "why".
++    proposed_by: list[str] = Field(default_factory=list)
++    # Another proposal targets the same resource with a different payload.
++    contested: bool = False
+diff --git a/apps/api/src/agentic_ai_api/agents/graph.py b/apps/api/src/agentic_ai_api/agents/graph.py
+index 080ffc5..b881ca9 100644
+--- a/apps/api/src/agentic_ai_api/agents/graph.py
++++ b/apps/api/src/agentic_ai_api/agents/graph.py
+@@ -8,7 +8,9 @@ from uuid import UUID
+ from langgraph.graph import END, START, StateGraph
+ from langgraph.types import RetryPolicy
+ 
++from agentic_ai_api.agents.actions import partition_proposals
+ from agentic_ai_api.agents.contracts import ActionProposal, ConfidenceDecision, PlanOutput, SpecialistName
++from agentic_ai_api.agents.reconciliation import reconcile
+ from agentic_ai_api.agents.services import AgentServices
+ from agentic_ai_api.core.config import Settings
+ from agentic_ai_api.llm.gateway import ModelGatewayError
+@@ -41,6 +43,8 @@ class AgentState(TypedDict, total=False):
+     pending_specialists: list[SpecialistName]
+     completed_specialists: list[SpecialistName]
+     proposals: list[dict[str, object]]
++    # Proposals dropped before policy because they could not be executed as written.
++    rejected_proposals: list[dict[str, str]]
+     decisions: list[dict[str, object]]
+     status: Literal["running", "completed", "needs_review", "rejected"]
+ 
+@@ -104,14 +108,24 @@ class AgentGraphFactory:
+             )
+             pending = [item for item in state.get("pending_specialists", []) if item != specialist]
+             completed = [*state.get("completed_specialists", []), specialist]
++            # Drop proposals that cannot be executed before they reach the policy. The policy
++            # weighs confidence and risk; it has no view on whether the arguments are usable.
++            accepted, rejected = partition_proposals(list(result.proposals))
+             proposals = [
+                 *state.get("proposals", []),
+-                *(item.model_dump(mode="json") for item in result.proposals),
++                # Attribution travels with the proposal so reconciliation and the audit log
++                # can both answer "which specialist wanted this?".
++                *({**item.model_dump(mode="json"), "specialist": specialist} for item in accepted),
++            ]
++            rejections = [
++                *state.get("rejected_proposals", []),
++                *({**item, "specialist": specialist} for item in rejected),
+             ]
+             return {
+                 "pending_specialists": pending,
+                 "completed_specialists": completed,
+                 "proposals": proposals,
++                "rejected_proposals": rejections,
+             }
+ 
+         return run
+@@ -125,20 +139,38 @@ class AgentGraphFactory:
+     def _confidence_policy(self, state: AgentState) -> AgentState:
+         decisions: list[dict[str, object]] = []
+         requires_review = state.get("status") == "needs_review"
+-        for proposal_json in state.get("proposals", []):
+-            proposal = ActionProposal.model_validate(proposal_json)
+-            approval_required = (
+-                requires_review
+-                or proposal.risk_level != "low"
+-                or proposal.confidence < self._settings.agent_auto_approval_confidence
++        # Fan-in: specialists worked independently, so the same action can arrive several
++        # times, and two specialists can target one resource with different payloads.
++        reconciled = reconcile(list(state.get("proposals", [])))
++        for item in reconciled:
++            proposal = ActionProposal.model_validate(item)
++            contested = bool(item["contested"])
++            proposed_by = [str(name) for name in item["proposed_by"]]
++            reasons: list[str] = []
++            if requires_review:
++                reasons.append("the plan itself was routed for review")
++            if contested:
++                reasons.append("another proposal targets the same resource with different arguments")
++            if proposal.risk_level != "low":
++                reasons.append(f"risk level is {proposal.risk_level}")
++            if proposal.confidence < self._settings.agent_auto_approval_confidence:
++                reasons.append(
++                    f"confidence {proposal.confidence:.2f} is below the "
++                    f"{self._settings.agent_auto_approval_confidence:.2f} auto-approval threshold"
++                )
++
++            approval_required = bool(reasons)
++            reason = (
++                f"Requires human approval: {'; '.join(reasons)}."
++                if approval_required
++                else "Eligible for later policy evaluation."
+             )
+-            reason = "Eligible for later policy evaluation."
+-            if approval_required:
+-                reason = "Requires human approval due to confidence or risk policy."
+             decision = ConfidenceDecision(
+                 action_type=proposal.action_type,
+                 approval_required=approval_required,
+                 reason=reason,
++                proposed_by=proposed_by,
++                contested=contested,
+             )
+             decisions.append(decision.model_dump(mode="json"))
+         return {
+diff --git a/apps/api/src/agentic_ai_api/agents/reconciliation.py b/apps/api/src/agentic_ai_api/agents/reconciliation.py
+new file mode 100644
+index 0000000..721cf70
+--- /dev/null
++++ b/apps/api/src/agentic_ai_api/agents/reconciliation.py
+@@ -0,0 +1,96 @@
++"""Fan-in for specialist proposals: collapse duplicates, surface disagreement.
++
++The supervisor fans an event out to several specialists, each of which analyses it in
++isolation. Nothing fanned back in, so a live run produced five proposals for two real
++actions: three identical Jira transitions, and two Slack replies to the same channel with
++different text. Both Slack replies scored above the auto-approval threshold at low risk, so
++an execution layer would have posted two messages to #eng-backend.
++
++Two distinct situations, deliberately handled differently:
++
++* **Identical proposals** are agreement. Collapse them into one and record who proposed it.
++  Three specialists reaching the same conclusion is corroboration, not three units of work.
++* **Different payloads aimed at the same target** are disagreement. Keep them all, mark them
++  contested, and deny auto-approval. Two specialists proposing different replies to the same
++  channel is a decision a human should make, not an ordering the system picks by luck.
++"""
++
++from __future__ import annotations
++
++import json
++from typing import Any
++
++# The arguments that identify what a proposal acts on. Two proposals sharing an action_type
++# and these values are aimed at the same thing, whatever else differs.
++TARGET_ARGUMENTS: dict[str, tuple[str, ...]] = {
++    "slack.reply": ("channel",),
++    "jira.transition": ("issue_key",),
++    "jira.comment": ("issue_key",),
++    "github.comment": ("owner", "repo", "number"),
++    "notification.send": ("recipient",),
++    "knowledge.store": ("title",),
++}
++
++_RISK_ORDER = {"low": 0, "medium": 1, "high": 2}
++
++
++def _identity(proposal: dict[str, Any]) -> str:
++    """Everything that makes two proposals the same action with the same payload."""
++    arguments = json.dumps(proposal.get("arguments", {}), sort_keys=True)
++    return f"{proposal['action_type']}::{arguments}"
++
++
++def _target(proposal: dict[str, Any]) -> str:
++    """What the proposal acts on, ignoring payload differences."""
++    action_type = str(proposal["action_type"])
++    keys = TARGET_ARGUMENTS.get(action_type)
++    arguments = proposal.get("arguments", {})
++    if keys is None:
++        # Undeclared targets fall back to identity, so nothing is wrongly grouped together.
++        return _identity(proposal)
++    values = {key: arguments.get(key) for key in keys}
++    return f"{action_type}::{json.dumps(values, sort_keys=True)}"
++
++
++def _merge(duplicates: list[dict[str, Any]]) -> dict[str, Any]:
++    """Combine identical proposals conservatively: highest risk, lowest confidence."""
++    first = duplicates[0]
++    risk = max((str(item["risk_level"]) for item in duplicates), key=lambda level: _RISK_ORDER[level])
++    confidence = min(float(item["confidence"]) for item in duplicates)
++    proposed_by = sorted({str(item["specialist"]) for item in duplicates if item.get("specialist")})
++    return {
++        "action_type": first["action_type"],
++        "arguments": first.get("arguments", {}),
++        "risk_level": risk,
++        "confidence": confidence,
++        "rationale": first["rationale"],
++        "proposed_by": proposed_by,
++        "contested": False,
++    }
++
++
++def reconcile(proposals: list[dict[str, Any]]) -> list[dict[str, Any]]:
++    """Collapse identical proposals and mark those competing for the same target.
++
++    Order is preserved by first appearance so runs stay deterministic.
++    """
++    grouped: dict[str, list[dict[str, Any]]] = {}
++    order: list[str] = []
++    for proposal in proposals:
++        key = _identity(proposal)
++        if key not in grouped:
++            grouped[key] = []
++            order.append(key)
++        grouped[key].append(proposal)
++
++    merged = [_merge(grouped[key]) for key in order]
++
++    # A target reached by more than one distinct payload is contested.
++    targets: dict[str, int] = {}
++    for item in merged:
++        target = _target(item)
++        targets[target] = targets.get(target, 0) + 1
++    for item in merged:
++        if targets[_target(item)] > 1:
++            item["contested"] = True
++    return merged
+diff --git a/apps/api/tests/test_agent_actions.py b/apps/api/tests/test_agent_actions.py
+new file mode 100644
+index 0000000..3e72766
+--- /dev/null
++++ b/apps/api/tests/test_agent_actions.py
+@@ -0,0 +1,99 @@
++"""Proposal executability checks run independently of confidence and risk."""
++
++from __future__ import annotations
++
++import pytest
++
++from agentic_ai_api.agents.actions import (
++    ACTION_CATALOGUE,
++    partition_proposals,
++    rejection_reason,
++)
++from agentic_ai_api.agents.contracts import ActionProposal
++
++
++def _proposal(action_type: str, arguments: dict[str, object]) -> ActionProposal:
++    return ActionProposal(
++        action_type=action_type,
++        arguments=arguments,
++        confidence=0.99,
++        risk_level="low",
++        rationale="High confidence and low risk on purpose; executability is a separate axis.",
++    )
++
++
++def test_well_formed_proposal_is_accepted() -> None:
++    proposal = _proposal(
++        "github.comment",
++        {"owner": "dhairya1411", "repo": "agentic-ai-platform", "number": 482, "body": "Rolled back."},
++    )
++    assert rejection_reason(proposal) is None
++
++
++def test_placeholder_arguments_are_rejected() -> None:
++    """The failure found in the first live Groq run."""
++    proposal = _proposal(
++        "github.comment",
++        {"owner": "<owner>", "repo": "<repo>", "number": 482, "body": "Rolled back."},
++    )
++    reason = rejection_reason(proposal)
++    assert reason is not None
++    assert "owner" in reason
++
++
++def test_placeholder_in_free_text_is_rejected_without_a_pattern_to_fail() -> None:
++    proposal = _proposal("jira.comment", {"issue_key": "ABC-1043", "comment": "{{summary}}"})
++    reason = rejection_reason(proposal)
++    assert reason is not None
++    assert "placeholder" in reason
++
++
++def test_undeclared_action_is_rejected() -> None:
++    reason = rejection_reason(_proposal("jira.delete_project", {"key": "ABC"}))
++    assert reason == "'jira.delete_project' is not a declared action"
++
++
++def test_missing_required_argument_is_rejected() -> None:
++    reason = rejection_reason(_proposal("jira.transition", {"issue_key": "ABC-1043"}))
++    assert reason is not None
++    assert "status" in reason
++
++
++def test_unexpected_argument_is_rejected() -> None:
++    reason = rejection_reason(
++        _proposal("jira.transition", {"issue_key": "ABC-1043", "status": "In Progress", "force": True})
++    )
++    assert reason is not None
++    assert "force" in reason
++
++
++@pytest.mark.parametrize("issue_key", ["abc-1043", "ABC1043", "ABC-", "-1043", "<issue>"])
++def test_malformed_issue_keys_are_rejected(issue_key: str) -> None:
++    assert rejection_reason(_proposal("jira.comment", {"issue_key": issue_key, "comment": "x"})) is not None
++
++
++def test_boolean_is_not_accepted_where_an_integer_is_declared() -> None:
++    proposal = _proposal(
++        "github.comment", {"owner": "dhairya1411", "repo": "repo", "number": True, "body": "x"}
++    )
++    reason = rejection_reason(proposal)
++    assert reason is not None
++    assert "integer" in reason
++
++
++def test_partition_keeps_good_proposals_and_explains_the_rest() -> None:
++    good = _proposal("jira.transition", {"issue_key": "ABC-1043", "status": "In Progress"})
++    bad = _proposal("github.comment", {"owner": "<owner>", "repo": "<repo>", "number": 1, "body": "x"})
++    accepted, rejected = partition_proposals([good, bad])
++
++    assert accepted == [good]
++    assert len(rejected) == 1
++    assert rejected[0]["action_type"] == "github.comment"
++    assert rejected[0]["reason"]
++
++
++def test_every_catalogue_entry_declares_a_closed_schema() -> None:
++    """A declared action with an open schema would let unchecked arguments through."""
++    for action_type, definition in ACTION_CATALOGUE.items():
++        assert definition.parameters["additionalProperties"] is False, action_type
++        assert definition.parameters["required"], action_type
+diff --git a/apps/api/tests/test_agent_graph.py b/apps/api/tests/test_agent_graph.py
+index 9d9e826..34cea7b 100644
+--- a/apps/api/tests/test_agent_graph.py
++++ b/apps/api/tests/test_agent_graph.py
+@@ -39,7 +39,9 @@ class FakeServices:
+             proposals=[
+                 ActionProposal(
+                     action_type="jira.transition",
+-                    arguments={"issue_key": "ABC-1"},
++                    # Must be a fully executable proposal: the graph now drops proposals
++                    # whose arguments could not actually be carried out.
++                    arguments={"issue_key": "ABC-1", "status": "Done"},
+                     confidence=0.95,
+                     risk_level="low",
+                     rationale="The source event identifies a completed backend change.",
+@@ -88,3 +90,98 @@ async def test_retry_policy_retries_transient_planner_failure() -> None:
+     )
+ 
+     assert services.plan_calls == 2
++
++
++class PlaceholderServices(FakeServices):
++    """Reproduces the first live Groq run: a confident proposal nobody could execute."""
++
++    async def analyze(self, **kwargs: object) -> SpecialistOutput:
++        self.specialists.append(str(kwargs["specialist"]))
++        return SpecialistOutput(
++            summary="Analysis complete",
++            confidence=0.97,
++            proposals=[
++                ActionProposal(
++                    action_type="github.comment",
++                    arguments={"owner": "<owner>", "repo": "<repo>", "number": 482, "body": "Rolled back."},
++                    confidence=0.96,
++                    risk_level="low",
++                    rationale="The event names PR 482 as the likely cause of the incident.",
++                )
++            ],
++        )
++
++
++@pytest.mark.asyncio
++async def test_unexecutable_proposals_never_reach_the_policy() -> None:
++    services = PlaceholderServices()
++    graph = AgentGraphFactory(Settings(), services).compile(InMemorySaver())
++
++    result = await graph.ainvoke(
++        {"organization_id": str(uuid4()), "trace_id": "trace-4", "event": {"body": "500s after deploy"}},
++        {"configurable": {"thread_id": "workflow-4"}},
++    )
++
++    assert result["proposals"] == []
++    assert result["decisions"] == []
++    rejected = result["rejected_proposals"]
++    assert len(rejected) == 2  # one per specialist the planner routed to
++    assert all(item["action_type"] == "github.comment" for item in rejected)
++    assert all("placeholder" in item["reason"] for item in rejected)
++
++
++class DisagreeingServices(FakeServices):
++    """Two specialists reply to the same Slack channel with different text."""
++
++    async def analyze(self, **kwargs: object) -> SpecialistOutput:
++        specialist = str(kwargs["specialist"])
++        self.specialists.append(specialist)
++        return SpecialistOutput(
++            summary="Analysis complete",
++            confidence=0.97,
++            proposals=[
++                ActionProposal(
++                    action_type="slack.reply",
++                    arguments={"channel": "#eng-backend", "text": f"Reply written by {specialist}."},
++                    confidence=0.95,
++                    risk_level="low",
++                    rationale="The event arrived in this channel and warrants acknowledgement.",
++                )
++            ],
++        )
++
++
++@pytest.mark.asyncio
++async def test_duplicate_proposals_collapse_into_one_decision() -> None:
++    services = FakeServices()
++    graph = AgentGraphFactory(Settings(), services).compile(InMemorySaver())
++
++    result = await graph.ainvoke(
++        {"organization_id": str(uuid4()), "trace_id": "trace-5", "event": {"body": "done"}},
++        {"configurable": {"thread_id": "workflow-5"}},
++    )
++
++    # Both specialists proposed the identical transition; one action, both credited.
++    assert len(result["proposals"]) == 2
++    assert len(result["decisions"]) == 1
++    assert result["decisions"][0]["proposed_by"] == ["jira", "slack"]
++    assert result["decisions"][0]["contested"] is False
++
++
++@pytest.mark.asyncio
++async def test_contested_proposals_cannot_auto_approve() -> None:
++    services = DisagreeingServices()
++    graph = AgentGraphFactory(Settings(), services).compile(InMemorySaver())
++
++    result = await graph.ainvoke(
++        {"organization_id": str(uuid4()), "trace_id": "trace-6", "event": {"body": "500s"}},
++        {"configurable": {"thread_id": "workflow-6"}},
++    )
++
++    decisions = result["decisions"]
++    assert len(decisions) == 2
++    # Low risk and 0.95 confidence would otherwise clear the 0.92 threshold.
++    assert all(decision["approval_required"] for decision in decisions)
++    assert all(decision["contested"] for decision in decisions)
++    assert all("same resource" in decision["reason"] for decision in decisions)
++    assert result["status"] == "needs_review"
+diff --git a/apps/api/tests/test_agent_reconciliation.py b/apps/api/tests/test_agent_reconciliation.py
+new file mode 100644
+index 0000000..29a26c7
+--- /dev/null
++++ b/apps/api/tests/test_agent_reconciliation.py
+@@ -0,0 +1,95 @@
++"""Fan-in behaviour: agreement collapses, disagreement is surfaced."""
++
++from __future__ import annotations
++
++from agentic_ai_api.agents.reconciliation import reconcile
++
++
++def _proposal(
++    action_type: str,
++    arguments: dict[str, object],
++    specialist: str,
++    *,
++    confidence: float = 0.95,
++    risk_level: str = "low",
++) -> dict[str, object]:
++    return {
++        "action_type": action_type,
++        "arguments": arguments,
++        "confidence": confidence,
++        "risk_level": risk_level,
++        "rationale": "Recorded so the audit log can explain the action.",
++        "specialist": specialist,
++    }
++
++
++def test_identical_proposals_collapse_and_record_every_proposer() -> None:
++    """Three specialists reaching the same conclusion is one action, corroborated."""
++    transition = {"issue_key": "ABC-1043", "status": "In Progress"}
++    reconciled = reconcile(
++        [
++            _proposal("jira.transition", transition, "slack"),
++            _proposal("jira.transition", transition, "jira"),
++            _proposal("jira.transition", transition, "github"),
++        ]
++    )
++
++    assert len(reconciled) == 1
++    assert reconciled[0]["proposed_by"] == ["github", "jira", "slack"]
++    assert reconciled[0]["contested"] is False
++
++
++def test_same_target_with_different_payloads_is_contested() -> None:
++    """The two Slack replies from the live run: same channel, different text."""
++    reconciled = reconcile(
++        [
++            _proposal("slack.reply", {"channel": "#eng-backend", "text": "Thanks, reviewing."}, "slack"),
++            _proposal("slack.reply", {"channel": "#eng-backend", "text": "Rolled back, see PR."}, "github"),
++        ]
++    )
++
++    assert len(reconciled) == 2
++    assert all(item["contested"] is True for item in reconciled)
++
++
++def test_same_action_on_different_targets_is_not_contested() -> None:
++    reconciled = reconcile(
++        [
++            _proposal("jira.comment", {"issue_key": "ABC-1043", "comment": "a"}, "jira"),
++            _proposal("jira.comment", {"issue_key": "ABC-2000", "comment": "b"}, "slack"),
++        ]
++    )
++
++    assert len(reconciled) == 2
++    assert all(item["contested"] is False for item in reconciled)
++
++
++def test_merge_is_conservative_on_risk_and_confidence() -> None:
++    """A duplicate must never be safer than the least safe way it was proposed."""
++    arguments = {"issue_key": "ABC-1043", "status": "Done"}
++    reconciled = reconcile(
++        [
++            _proposal("jira.transition", arguments, "jira", confidence=0.99, risk_level="low"),
++            _proposal("jira.transition", arguments, "slack", confidence=0.71, risk_level="high"),
++        ]
++    )
++
++    assert len(reconciled) == 1
++    assert reconciled[0]["risk_level"] == "high"
++    assert reconciled[0]["confidence"] == 0.71
++
++
++def test_order_is_preserved_by_first_appearance() -> None:
++    reconciled = reconcile(
++        [
++            _proposal("slack.reply", {"channel": "#a", "text": "x"}, "slack"),
++            _proposal("jira.comment", {"issue_key": "ABC-1", "comment": "y"}, "jira"),
++            _proposal("slack.reply", {"channel": "#a", "text": "x"}, "github"),
++        ]
++    )
++
++    assert [item["action_type"] for item in reconciled] == ["slack.reply", "jira.comment"]
++
++
++def test_empty_input_produces_no_decisions() -> None:
++    assert reconcile([]) == []

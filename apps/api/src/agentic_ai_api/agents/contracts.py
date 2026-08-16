@@ -48,3 +48,8 @@ class ConfidenceDecision(BaseModel):
     action_type: str
     approval_required: bool
     reason: str
+    # Which specialists proposed this action. More than one is corroboration, and the
+    # audit log should be able to answer "who wanted this?" as well as "why".
+    proposed_by: list[str] = Field(default_factory=list)
+    # Another proposal targets the same resource with a different payload.
+    contested: bool = False

@@ -21,6 +21,7 @@ from uuid import UUID, uuid4
 
 from langgraph.checkpoint.memory import InMemorySaver
 
+from agentic_ai_api.agents.actions import ACTION_CATALOGUE
 from agentic_ai_api.agents.graph import AgentGraphFactory
 from agentic_ai_api.agents.services import GatewayAgentServices
 from agentic_ai_api.core.config import get_settings
@@ -54,8 +55,15 @@ SPECIALIST_TEMPLATE = """You are the {specialist} specialist in a governed agent
 You analyse the event and propose actions. You never execute anything - every proposal is
 reviewed by a confidence and risk policy before a human sees it.
 
-For each proposal:
-- action_type is lowercase dotted, e.g. jira.transition, slack.reply, github.comment
+You may only propose these declared actions, with exactly these arguments:
+
+{catalogue}
+
+Rules:
+- Every argument must come from the event. If the event does not supply a required value -
+  a repository name, an issue key - do NOT propose that action. Never invent a value and
+  never emit a placeholder like <owner> or {{{{repo}}}}. Proposals with unusable arguments
+  are rejected before a human ever sees them.
 - risk_level is low, medium or high. Anything that writes to a system another human relies
   on, or that is hard to reverse, is not low.
 - confidence is your certainty this action is correct, from 0 to 1.
@@ -65,6 +73,15 @@ Propose nothing if the event does not warrant action in your domain. An empty pr
 is a valid, often correct answer.
 
 Respond only with the required JSON object."""
+
+
+def _catalogue_text() -> str:
+    """Render the declared actions so specialists cannot invent action types or arguments."""
+    lines = []
+    for action_type, definition in sorted(ACTION_CATALOGUE.items()):
+        required = ", ".join(definition.parameters["required"])
+        lines.append(f"  {action_type}({required}) - {definition.description}")
+    return "\n".join(lines)
 
 DEFAULT_EVENT = {
     "source": "slack",
@@ -102,7 +119,10 @@ async def main() -> int:
         gateway=gateway,
         planner_prompt=_prompt("planner", PLANNER_TEMPLATE),
         specialist_prompts={
-            name: _prompt(f"specialist.{name}", SPECIALIST_TEMPLATE.format(specialist=name))
+            name: _prompt(
+                f"specialist.{name}",
+                SPECIALIST_TEMPLATE.format(specialist=name, catalogue=_catalogue_text()),
+            )
             for name in (
                 "slack", "github", "jira", "meeting",
                 "standup", "reporting", "notification", "knowledge",
@@ -138,10 +158,19 @@ async def main() -> int:
         print(f"      args   : {json.dumps(proposal.get('arguments', {}))}")
         print(f"      because: {proposal['rationale'][:140]}")
 
-    print(f"\nDECISIONS ({len(result.get('decisions', []))})")
-    for decision in result.get("decisions", []):
+    rejected = result.get("rejected_proposals", [])
+    if rejected:
+        print(f"\nREJECTED BEFORE POLICY ({len(rejected)}) - not executable as written")
+        for item in rejected:
+            print(f"  {item['action_type']:<24} [{item.get('specialist', '?')}]  {item['reason']}")
+
+    decisions = result.get("decisions", [])
+    print(f"\nDECISIONS ({len(decisions)} after fan-in, from {len(result.get('proposals', []))} proposals)")
+    for decision in decisions:
         gate = "NEEDS APPROVAL" if decision["approval_required"] else "auto-approvable"
-        print(f"  {decision['action_type']:<24} {gate}")
+        flag = "  [CONTESTED]" if decision.get("contested") else ""
+        print(f"  {decision['action_type']:<24} {gate}{flag}")
+        print(f"      proposed by: {', '.join(decision.get('proposed_by') or ['?'])}")
         print(f"      {decision['reason']}")
 
     print(f"\nfinal status: {result.get('status')}")
