@@ -3,16 +3,26 @@
 from __future__ import annotations
 
 from functools import lru_cache
+from pathlib import Path
 from typing import Literal
 
 from pydantic import Field, SecretStr, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+# Load .env from both the repo root and this service folder, regardless of the
+# current working directory. Later entries win, so a service-local apps/api/.env
+# overrides the repo root if both are present.
+_SERVICE_ROOT = Path(__file__).resolve().parents[3]  # apps/api
+_REPO_ROOT = Path(__file__).resolve().parents[5]  # repository root
+_ENV_FILES = (_REPO_ROOT / ".env", _SERVICE_ROOT / ".env")
+
 
 class Settings(BaseSettings):
     """Runtime settings with production-only secret safeguards."""
 
-    model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
+    model_config = SettingsConfigDict(
+        env_file=_ENV_FILES, env_file_encoding="utf-8", extra="ignore"
+    )
 
     app_env: Literal["development", "test", "staging", "production"] = "development"
     app_name: str = "Agentic AI Platform"
